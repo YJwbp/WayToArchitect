@@ -419,7 +419,7 @@ public interface IInterface
 
 ![img](https:////upload-images.jianshu.io/upload_images/944365-2f530e964ffab8d7.png)
 
-流程图
+![Binder通信过程](https://user-gold-cdn.xitu.io/2020/4/24/171ab7a654b4bff7)
 
 ------
 
