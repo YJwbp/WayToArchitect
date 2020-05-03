@@ -1913,9 +1913,3 @@ public void setWillNotDraw(boolean willNotDraw) {
 
 ![img](https:////upload-images.jianshu.io/upload_images/944365-c9d3cd1d746be319.png)
 
-
-
-
-
-# 五、触发逻辑
-

@@ -171,6 +171,10 @@ AndroidManifest.xml文件，也叫清单文件，来获知应用中是否包含�
 - 声明应用所需的最低 Android API 级别
 - 列出应用必须链接到的库
 
+## 匿名共享内存原理
+
+https://www.jianshu.com/p/d9bc9c668ba6
+
 
 
 # Handler机制
@@ -400,6 +404,14 @@ public void dispatchMessage(Message msg) {
 **消息缓存：**
 
 为了提供效率，提供了一个大小为50的Message缓存队列，减少对象不断创建与销毁的过程。
+
+
+
+## 高级部分
+
+### IdleHandler
+
+###同步屏障
 
 
 
@@ -877,7 +889,15 @@ Android系统启动的核心流程如下：
 
 
 
-# 渲染机制
+# 屏幕刷新机制
+
+总体流程、
+
+源码分析
+
+https://www.jianshu.com/p/10db590ed9a6 这个有些总结不错
+
+
 
 ### 26、TextView调用setText方法的内部执行流程。
 
@@ -886,6 +906,14 @@ Canvas的底层机制，绘制框架，硬件加速是什么原理，canvas lock
 
 
 # AmS、PMS、WmS等
+
+各种交互过程中涉及到的类！！
+
+deeplink 原理：https://www.jianshu.com/p/eb20492acf25
+
+十分钟了解Android触摸事件原理（InputManagerService）：https://www.jianshu.com/p/f05d6b05ba17
+
+
 
 ## 类介绍
 
@@ -949,6 +977,10 @@ WMS(WindowManagerService)：管理的整个系统所有窗口的UI（显示、�
 * 输入系统相关：派发系统按键和触摸消息
 
   > 当接收到一个触摸事件，它需要寻找一个最合适的窗口来处理消息，而WMS是窗口的管理者，系统中所有的窗口状态和信息都在其掌握之中，完成这一工作不在话下。
+
+
+
+Window添加流程：https://www.jianshu.com/p/40776c123adb
 
 
 
