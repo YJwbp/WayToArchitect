@@ -411,7 +411,391 @@ public void dispatchMessage(Message msg) {
 
 ### IdleHandler
 
+####1、简介
+
+在 Looper 事件循环的过程中，当MessageQueue 出现空闲的时候，会执行一次queueIdle，允许我们执行一些任务。
+
+
+
+#### 2、源码解析
+
+```java
+// MessageQueue类的静态内部类
+// 官方注释：用来发现某线程没有更多消息的回调接口
+public static interface IdleHandler {
+    /**
+     * Called when the message queue has run out of messages and will now
+     * wait for more.  Return true to keep your idle handler active, false
+     * to have it removed.  This may be called if there are still messages
+     * pending in the queue, but they are all scheduled to be dispatched
+     * after the current time.
+     */
+  	// 消息队列清空时会回调;
+  	// 返回值：false，表示回调之后会移除监听；true，不移除，下次idle还能收到回调
+    boolean queueIdle();
+}
+```
+
+
+
+```java
+// MessageQueue类
+Message next() {
+    int pendingIdleHandlerCount = -1; // -1 only during first iteration
+    int nextPollTimeoutMillis = 0;
+    for (;;) {
+        nativePollOnce(ptr, nextPollTimeoutMillis);
+
+        // Run the idle handlers.
+        // We only ever reach this code block during the first iteration.
+        for (int i = 0; i < pendingIdleHandlerCount; i++) {
+            final IdleHandler idler = mPendingIdleHandlers[i];
+            mPendingIdleHandlers[i] = null; // release the reference to the handler
+
+            boolean keep = false;
+            try {
+                keep = idler.queueIdle();
+            } catch (Throwable t) {
+                Log.wtf(TAG, "IdleHandler threw exception", t);
+            }
+
+            if (!keep) {
+              	// 这里会移除返回false的IdlerHandler
+                synchronized (this) {
+                    mIdleHandlers.remove(idler);
+                }
+            }
+        }
+
+        // Reset the idle handler count to 0 so we do not run them again.
+        pendingIdleHandlerCount = 0;
+
+        // While calling an idle handler, a new message could have been delivered
+        // so go back and look again for a pending message without waiting.
+        nextPollTimeoutMillis = 0;
+    }
+}
+```
+
+#### 3、用法
+
+```java
+Looper.myQueue().addIdleHandler(new MessageQueue.IdleHandler())
+```
+
+
+
+**场景：**
+
+看需求吧，主要就是消息队列不忙的时候做些事情，但是调用时机没法保证
+
+一些第三方库中有使用，比如LeakCanary，Glide中有使用到，具体可以自行去查看
+
+
+
 ###同步屏障
+
+####1、简介
+
+MessageQueue正常情况是同步处理消息的，同步屏障，看字面意思也能猜出个八九分，就是阻碍队列中同步消息的屏障，阻碍同步消息，只允许通过异步消息。
+
+
+
+#####有什么用呢？
+
+ViewRootImpl类`scheduleTraversals`触发绘制的时候就用到了，如下图所示：
+
+![image-20200504145216159](https://tva1.sinaimg.cn/large/007S8ZIlly1gegf7bn9vuj31em0len1x.jpg)
+
+当同步信号来的时候，消息队列里面还有很多消息要处理，这时候就算你将布局优化得很彻底，保证绘制当前 View 树不会超过 16ms，但是前面还有很多消息要处理，所有时间加起来可能就超过16ms了，那还是会丢帧（没有绘制完，底层取到的还是上一帧的画面）
+
+而加入同步屏障，就可以将`遍历绘制View树的Msg5`提到最前面，保证优先执行，这样就避免了这种情况下的丢帧问题。
+
+当然了，这样也不能完全避免丢帧，典型情况就是上一个消息执行时间太长，甚至上一个消息本身就执行了好几个刷新周期。
+
+
+
+####2、源码解析
+
+##### 2.0 异步消息
+
+没听说还有异步消息，它究竟是什么呢？
+
+
+
+有两种使用异步消息的方式：
+
+1. **Handler构造函数**
+
+   ```java
+   public Handler(Callback callback, boolean async) {
+       mLooper = Looper.myLooper();
+       if (mLooper == null) {
+           throw new RuntimeException(
+               "Can't create handler inside thread " + Thread.currentThread()
+                       + " that has not called Looper.prepare()");
+       }
+       mQueue = mLooper.mQueue;
+       mCallback = callback;
+     	// 
+       mAsynchronous = async;
+   }
+   ```
+
+   只要async参数为true，这个handler发出的所有的消息都将是异步消息：
+
+   ```java
+   private boolean enqueueMessage(MessageQueue queue, Message msg, long uptimeMillis) {
+        msg.target = this;
+        if (mAsynchronous) {
+          	// 这里将消息设置为异步消息
+            msg.setAsynchronous(true);
+        }
+        return queue.enqueueMessage(msg, uptimeMillis);
+    }
+   ```
+
+   
+
+2. **Message设置**
+
+   看到上面的源码，自然也知道，可以自己给Message设置异步标识了。
+
+   ```java
+   Message message = Message.obtain();
+   message.setAsynchronous(true);
+   ```
+
+   
+
+##### 2.1 开启
+
+这么简单，设置一个标记就开启同步屏障了？？当然不是！
+
+要开启屏障只需要调用：
+
+```java
+handler.getLooper().getQueue().postSyncBarrier();
+```
+
+
+
+来看看里面做了什么：（简单来说，就是创建了一个target为null的消息，并塞到链表头）
+
+```java
+// public final class MessageQueue {
+public int postSyncBarrier() {
+    return postSyncBarrier(SystemClock.uptimeMillis());
+}
+
+// 只插入消息，不唤醒
+private int postSyncBarrier(long when) {
+    // Enqueue a new sync barrier token.
+    // We don't need to wake the queue because the purpose of a barrier is to stall it.
+    synchronized (this) {
+        final int token = mNextBarrierToken++;
+        final Message msg = Message.obtain();
+        msg.markInUse();
+        msg.when = when;
+        msg.arg1 = token;
+
+        Message prev = null;
+        Message p = mMessages;
+        if (when != 0) {
+            while (p != null && p.when <= when) {
+                prev = p;
+                p = p.next;
+            }
+        }
+        if (prev != null) { // invariant: p == prev.next
+            msg.next = p;
+            prev.next = msg;
+        } else {
+            msg.next = p;
+            mMessages = msg;
+        }
+        return token;
+    }
+}
+```
+
+正常的加入消息，最终都会调用`nativeWake(mPtr);`，进行唤醒，从而开始处理消息，但是！！！
+
+**这里有一点很关键**，也是上面官方注释说的：这里只是添加一个消息，但是不唤醒消息队列，后面通过别的途径唤醒消息队列的时候，就可以取到这里加入的异步消息了。
+
+
+
+
+
+##### 2.2 怎么生效的呢？
+
+哦 开启好简单啊，可是原理是啥呢？简单来说：
+
+1. Looper循环从消息队列里取消息，调用到MessageQueue.next()，
+2. MessageQueue.next()里面，取出第一个异步消息，没有的异步消息的话就阻塞
+
+也就是说，开启同步屏障之后，我只会取异步消息
+
+```java
+Message next() {
+    int pendingIdleHandlerCount = -1; // -1 only during first iteration
+    int nextPollTimeoutMillis = 0;
+    for (;;) {
+        // Linux的epoll机制,nextPollTimeoutMillis传-1会让CPU沉睡
+        nativePollOnce(ptr, nextPollTimeoutMillis);
+
+        synchronized (this) {
+            // Try to retrieve the next message.  Return if found.
+            final long now = SystemClock.uptimeMillis();
+            Message prevMsg = null;
+            Message msg = mMessages;
+            if (msg != null && msg.target == null) {
+                // Stalled by a barrier.  Find the next asynchronous message in the queue.
+                do {
+                    prevMsg = msg;
+                    msg = msg.next;
+                } while (msg != null && !msg.isAsynchronous());
+            }
+            if (msg != null) {
+              // 省略很多代码 + 稍微修改
+              return msg;
+            } else {
+                // No more messages.
+              	// 这个值，会让CPU沉睡
+                nextPollTimeoutMillis = -1;
+            }
+
+            // If first time idle, then get the number of idlers to run.
+            // Idle handles only run if the queue is empty or if the first message
+            // in the queue (possibly a barrier) is due to be handled in the future.
+            if (pendingIdleHandlerCount < 0
+                    && (mMessages == null || now < mMessages.when)) {
+                pendingIdleHandlerCount = mIdleHandlers.size();
+            }
+            if (pendingIdleHandlerCount <= 0) {
+                // No idle handlers to run.  Loop and wait some more.
+                mBlocked = true;
+                continue;
+            }
+
+            if (mPendingIdleHandlers == null) {
+                mPendingIdleHandlers = new IdleHandler[Math.max(pendingIdleHandlerCount, 4)];
+            }
+            mPendingIdleHandlers = mIdleHandlers.toArray(mPendingIdleHandlers);
+        }
+
+        // Run the idle handlers.
+        // We only ever reach this code block during the first iteration.
+        for (int i = 0; i < pendingIdleHandlerCount; i++) {
+            final IdleHandler idler = mPendingIdleHandlers[i];
+            mPendingIdleHandlers[i] = null; // release the reference to the handler
+
+            boolean keep = false;
+            try {
+                keep = idler.queueIdle();
+            } catch (Throwable t) {
+                Log.wtf(TAG, "IdleHandler threw exception", t);
+            }
+
+            if (!keep) {
+                synchronized (this) {
+                    mIdleHandlers.remove(idler);
+                }
+            }
+        }
+
+        // Reset the idle handler count to 0 so we do not run them again.
+        pendingIdleHandlerCount = 0;
+
+        // While calling an idle handler, a new message could have been delivered
+        // so go back and look again for a pending message without waiting.
+        nextPollTimeoutMillis = 0;
+    }
+}
+```
+
+另外，可以看到，有IdleHandler的时候，是会去处理idleHandler的，没有的话才会沉睡。
+
+
+
+##### 2.3 怎么用呢？
+
+不用多想了，你用不了。。因为这个方法时hide的。。编译都不过。。
+
+```java
+ * @hide
+ */
+public int postSyncBarrier() {
+    return postSyncBarrier(SystemClock.uptimeMillis());
+}
+```
+
+
+
+但是framework里确实是有用到的地方的：ViewRootImpl类`scheduleTraversals`触发绘制的时候，这样可以保证尽早的刷新界面
+
+```java
+// ViewRootImpl类
+void scheduleTraversals() {
+    if (!mTraversalScheduled) {
+        mTraversalScheduled = true;
+      	//1、 开启同步屏障
+        mTraversalBarrier = mHandler.getLooper().getQueue().postSyncBarrier();
+      	// 2.1 马上发送异步消息
+        mChoreographer.postCallback(Choreographer.CALLBACK_TRAVERSAL, mTraversalRunnable, null);
+        if (!mUnbufferedInputDispatch) {
+            scheduleConsumeBatchedInput();
+        }
+        notifyRendererOfFramePending();
+        pokeDrawLockIfNeeded();
+    }
+}
+
+	//Choreographer类 2.2 发送异步消息
+ private void postCallbackDelayedInternal(int callbackType,
+          Object action, Object token, long delayMillis) {
+      synchronized (mLock) {
+          final long now = SystemClock.uptimeMillis();
+          final long dueTime = now + delayMillis;
+          mCallbackQueues[callbackType].addCallbackLocked(dueTime, action, token);
+
+          if (dueTime <= now) {
+              scheduleFrameLocked(now);
+          } else {
+              Message msg = mHandler.obtainMessage(MSG_DO_SCHEDULE_CALLBACK, action);
+              msg.arg1 = callbackType;
+            	// 发送异步消息，之前开启了同步屏障，然后马上发送异步消息，这样下一个消息就可以处理
+              msg.setAsynchronous(true);
+              mHandler.sendMessageAtTime(msg, dueTime);
+          }
+      }
+  }
+
+	// ViewRootImpl类
+   void doTraversal() {
+        if (mTraversalScheduled) {
+            mTraversalScheduled = false;
+          	// 3、移除同步屏障
+            mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
+            performTraversals();
+            if (mProfile) {
+                Debug.stopMethodTracing();
+                mProfile = false;
+            }
+        }
+    }
+```
+
+
+
+
+
+
+
+#####2.4 一些重要结论
+
+1. hide方法，用不了，也不推荐用
+2. 
 
 
 
@@ -419,7 +803,7 @@ public void dispatchMessage(Message msg) {
 
 ####主线程的死循环一直运行是不是特别消耗CPU资源呢？
 
- 其实不然，这里就涉及到Linux pipe/epoll机制，简单说就是在主线程的MessageQueue没有消息时，便阻塞在loop的queue.next()中的nativePollOnce()方法里，详情见[Android消息机制1-Handler(Java层)](https://link.zhihu.com/?target=http%3A//www.yuanhh.com/2015/12/26/handler-message-framework/%23next)，此时主线程会释放CPU资源进入休眠状态，直到下个消息到达或者有事务发生，通过往pipe管道写端写入数据来唤醒主线程工作。
+ 其实不然，这里就涉及到Linux pipe/epoll机制，简单说就是在主线程的MessageQueue没有消息时，便阻塞在loop的queue.next()中的nativePollOnce()方法里，详情见[Android消息机制1-Handler(Java层)](https://link.zhihu.com/?target=http%3A//www.yuanhh.com/2015/12/26/handler-message-framework/%23next)，此时主线程会释放CPU资源进入休眠状态，**直到下个消息到达或者有事务发生，通过往pipe管道写端写入数据来唤醒主线程工作**。
 
 这里采用的epoll机制，是一种IO多路复用机制，可以同时监控多个描述符，当某个描述符就绪(读或写就绪)，则立刻通知相应程序进行读或写操作，本质同步I/O，即读写是阻塞的。 所以说，主线程大多数时候都是处于休眠状态，并不会消耗大量CPU资源。
 
@@ -891,15 +1275,443 @@ Android系统启动的核心流程如下：
 
 # 屏幕刷新机制
 
-总体流程、
+![img](https://upload-images.jianshu.io/upload_images/1460468-311b22120397333b.png)
 
-源码分析
-
-https://www.jianshu.com/p/10db590ed9a6 这个有些总结不错
+来源于大苏的这篇文章：https://www.cnblogs.com/dasusu/p/8311324.html
 
 
 
-### 26、TextView调用setText方法的内部执行流程。
+文章太长了。。总结一下再整理吧。。
+
+
+
+## 1、背景知识
+
+###1、流程介绍
+
+在一个典型的显示系统中，一般包括CPU、GPU、display三个部分， CPU负责计算数据，把计算好数据交给GPU，GPU会对图形数据进行渲染，渲染好后放到buffer里存起来，屏幕以固定频率从buffer里读取数据显示。
+
+![image-20200504155110244](https://tva1.sinaimg.cn/large/007S8ZIlly1geggwl3au7j31360q4djt.jpg)
+
+### 2、双缓冲
+
+<img src="https://tva1.sinaimg.cn/large/007S8ZIlly1gegi5377kpj313c0kin3q.jpg" alt="image-20200504163357007" style="zoom: 33%;" />
+
+只有一个buffer的话，同时读写，数据会乱掉，表现就是画面错乱。
+
+需要引入读、写两个buffer，GPU以固定频率（屏幕刷新率）交换两个buffer：
+
+* BackBuffer：GPU向这里绘制数据
+* FrameBuffer：屏幕从这里读取数据
+
+若16ms交换时机到来，还未完成写操作，则放弃这次交换，于是屏幕读取到的还是上一帧的画面
+
+
+
+###3、CPU与屏幕刷新
+
+
+
+![image-20200504013341713](https://tva1.sinaimg.cn/large/007S8ZIlly1gefs4erwi6j313a0cowib.jpg)
+
+结合这张图，再来讲讲 16.6 ms 屏幕刷新一次的过程：
+
+1. 首先，屏幕每隔16ms都会刷新一次（从图像缓存读取数据），并发出一次VSync信号
+2. 如果客户端之前注册了信号监听，那么它就会收到这次信号，并做一些事情：
+   1. CPU进行**下一帧**的布局、绘制操作（layout、draw），这是CPU干的事情，也就是上图的蓝色
+   2. CPU绘制好之后，将结果送给GPU，GPU渲染更新缓冲区（给下次屏幕刷新用）
+3. 如果客户端先前没有注册监听，那么就不会收到VSync信号，那么也不会进行绘制、更新缓冲区的操作
+   1. 这样，当下一次屏幕刷新的时候，读取到的还是之前的图像(上图后半部分，一直显示的都是**4**)
+
+
+
+## 2、源码解析
+
+### 2.0 触发刷新
+
+```java
+//View类
+public void requestLayout() {
+		// ...
+    if (mParent != null && !mParent.isLayoutRequested()) {
+      // 请求父布局执行requestLayout
+      mParent.requestLayout();
+    }
+    if (mAttachInfo != null && mAttachInfo.mViewRequestingLayout == this) {
+        mAttachInfo.mViewRequestingLayout = null;
+    }
+}
+```
+
+1. 可以看到这里请求父布局执行requestLayout，而View的parent显然是个`ViewGroup`，
+
+2. 但是ViewGroup没有重写该方法，所以执行的还是这个View.requestLayout
+
+3. 于是，一直向上递归到最顶层，DecorView
+
+4. DecorView的mParent是`ViewRootImpl`（在wm.addView的时候创建ViewRootImpl，并绑定关系：decor.assignParent(ViewRootImpl，具体可以参考启动流程图）
+
+5. 而ViewRootImpl
+
+   ```java
+   // ViewRootImpl 类
+   @Override
+   public void requestLayout() {
+       if (!mHandlingLayoutInLayoutRequest) {
+           checkThread();
+           mLayoutRequested = true;
+           scheduleTraversals();
+       }
+   }
+   ```
+
+
+
+### 2.1 注册监听
+
+常用到的`invalidate`、`requestLayout`等触发刷新的方法，最终都是调用到了ViewRootImpl类的`scheduleTraversals`方法，该方法不是立即去刷新，而是注册了一个屏幕刷新监听，等下次垂直同步信号到达的时候，再做具体的刷新操作。
+
+下面`ViewRootImpl` --> `Choreographer` --> `FrameDisplayEventReceiver`逐层深入，每层都向更底层注册监听，并处理回调。（这不就是链式观察者吗）
+
+####1、ViewRootImpl.scheduleTraversals
+
+```java
+// ViewRootImpl类
+void scheduleTraversals() {
+    if (!mTraversalScheduled) {
+        mTraversalScheduled = true;
+      	// 1、开启同步屏障，保证下面的消息尽早处理
+        mTraversalBarrier = mHandler.getLooper().getQueue().postSyncBarrier();
+        // 2、这里向Choreographer注册了一个CALLBACK_TRAVERSAL类型的监听，触发事件时会调用mTraversalRunnable
+      	mChoreographer.postCallback(Choreographer.CALLBACK_TRAVERSAL, mTraversalRunnable, null);
+        if (!mUnbufferedInputDispatch) {
+            scheduleConsumeBatchedInput();
+        }
+        notifyRendererOfFramePending();
+        pokeDrawLockIfNeeded();
+    }
+}
+
+final class TraversalRunnable implements Runnable {
+        @Override
+        public void run() {
+            doTraversal();
+        }
+    }
+
+		// 3、收到消息进行刷新操作
+    void doTraversal() {
+      	// 标记位，防止触发多次刷新！！
+        if (mTraversalScheduled) {
+            mTraversalScheduled = false;
+            mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
+
+            if (mProfile) {
+                Debug.startMethodTracing("ViewAncestor");
+            }
+
+          	// 4、这里就是具体的刷新操作了：measure/layout/draw
+            performTraversals();
+
+            if (mProfile) {
+                Debug.stopMethodTracing();
+                mProfile = false;
+            }
+        }
+    }
+
+```
+
+
+
+####2、Choreographer.postCallback
+
+ViewRootImpl类调用mChoreographer.postCallback进行注册，具体做了什么呢？
+
+```java
+public final class Choreographer {
+  
+  // 1
+	public void postCallback(int callbackType, Runnable action, Object token) {
+	    postCallbackDelayed(callbackType, action, token, 0);
+	}
+  
+  // 2
+  public void postCallbackDelayed(int callbackType,
+         Runnable action, Object token, long delayMillis) {
+     if (action == null) {
+         throw new IllegalArgumentException("action must not be null");
+     }
+     if (callbackType < 0 || callbackType > CALLBACK_LAST) {
+         throw new IllegalArgumentException("callbackType is invalid");
+     }
+
+     postCallbackDelayedInternal(callbackType, action, token, delayMillis);
+ }
+  
+  // 3
+ private void postCallbackDelayedInternal(int callbackType,
+        Object action, Object token, long delayMillis) {
+    synchronized (mLock) {
+        final long now = SystemClock.uptimeMillis();
+        final long dueTime = now + delayMillis;
+        mCallbackQueues[callbackType].addCallbackLocked(dueTime, action, token);
+
+        if (dueTime <= now) {
+          	// 因为delay==0，会走到这里
+            scheduleFrameLocked(now);
+        } else {
+          	// 如果设置了delay，这里发送异步消息，将消息提前
+            Message msg = mHandler.obtainMessage(MSG_DO_SCHEDULE_CALLBACK, action);
+            msg.arg1 = callbackType;
+            msg.setAsynchronous(true);
+            mHandler.sendMessageAtTime(msg, dueTime);
+        }
+    	}
+    }
+}
+
+	// 3.1
+   private void scheduleFrameLocked(long now) {
+        if (!mFrameScheduled) {
+            mFrameScheduled = true;
+            if (USE_VSYNC) {
+                if (DEBUG_FRAMES) {
+                    Log.d(TAG, "Scheduling next frame on vsync.");
+                }
+
+                // If running on the Looper thread, then schedule the vsync immediately,
+                // otherwise post a message to schedule the vsync from the UI thread
+                // as soon as possible.
+                if (isRunningOnLooperThreadLocked()) {
+                    scheduleVsyncLocked();
+                } else {
+                  // 如果不在主线程，发一个异步消息，保证尽早执行，
+                  // 执行的内容也是：scheduleVsyncLocked();
+                    Message msg = mHandler.obtainMessage(MSG_DO_SCHEDULE_VSYNC);
+                    msg.setAsynchronous(true);
+                    mHandler.sendMessageAtFrontOfQueue(msg);
+                }
+            } else {
+                final long nextFrameTime = Math.max(
+                        mLastFrameTimeNanos / TimeUtils.NANOS_PER_MS + sFrameDelay, now);
+                if (DEBUG_FRAMES) {
+                    Log.d(TAG, "Scheduling next frame in " + (nextFrameTime - now) + " ms.");
+                }
+                Message msg = mHandler.obtainMessage(MSG_DO_FRAME);
+                msg.setAsynchronous(true);
+                mHandler.sendMessageAtTime(msg, nextFrameTime);
+            }
+        }
+    }
+
+   private void scheduleVsyncLocked() {
+        mDisplayEventReceiver.scheduleVsync();
+    }
+```
+
+
+
+####2、DisplayEventReceiver.scheduleVsync
+
+```java
+public abstract class DisplayEventReceiver {
+     public DisplayEventReceiver(Looper looper, int vsyncSource) {
+        if (looper == null) {
+            throw new IllegalArgumentException("looper must not be null");
+        }
+
+        mMessageQueue = looper.getQueue();
+       // 这里将Receiver跟native指针联系起来，从而可以收到native的回调
+        mReceiverPtr = nativeInit(new WeakReference<DisplayEventReceiver>(this), mMessageQueue,
+                vsyncSource);
+
+        mCloseGuard.open("dispose");
+    }
+  
+  
+/**
+ * Schedules a single vertical sync pulse to be delivered when the next
+ * display frame begins.
+ */
+public void scheduleVsync() {
+    if (mReceiverPtr == 0) {
+        Log.w(TAG, "Attempted to schedule a vertical sync pulse but the display event "
+                + "receiver has already been disposed.");
+    } else {
+      	// 可以看到这里向native层注册了一个回到，native会适时向mReceiverPtr发送事件
+        nativeScheduleVsync(mReceiverPtr);
+    }
+}
+```
+
+
+
+### 2.2 收到回调
+
+####1、DisplayEventReceiver.onVsync
+
+上节，将`DisplayEventReceiver`作为监听器，注册给native层，native会在下一次垂直同步时进行回调回来：
+
+```java
+/**
+ * Called when a vertical sync pulse is received.
+ * The recipient should render a frame and then call {@link #scheduleVsync}
+ * to schedule the next vertical sync pulse.
+ *
+ * @param timestampNanos The timestamp of the pulse, in the {@link System#nanoTime()}
+ * timebase.
+ * @param builtInDisplayId The surface flinger built-in display id such as
+ * {@link SurfaceControl#BUILT_IN_DISPLAY_ID_MAIN}.
+ * @param frame The frame number.  Increases by one for each vertical sync interval.
+ */
+public void onVsync(long timestampNanos, int builtInDisplayId, int frame) {
+}
+```
+
+上面的注释很有信息量啊：
+
+1. 收到垂直同步信号时会回调该方法
+2. 接收者应该渲染一帧，然后注册下次回调（即每次只监听一次信号）
+
+
+
+这里是个空实现，具体实现是Choreographer的内部类：
+
+```java
+// Choreographer类
+private final class FrameDisplayEventReceiver extends DisplayEventReceiver
+        implements Runnable {
+  @Override
+        public void onVsync(long timestampNanos, int builtInDisplayId, int frame) {
+            // ...
+            mTimestampNanos = timestampNanos;
+            mFrame = frame;
+          	// 发送异步消息，执行内容即下面的run方法
+            Message msg = Message.obtain(mHandler, this);
+            msg.setAsynchronous(true);
+            mHandler.sendMessageAtTime(msg, timestampNanos / TimeUtils.NANOS_PER_MS);
+        }
+
+        @Override
+        public void run() {
+            mHavePendingVsync = false;
+          	// 收到Vsync时，执行这里
+            doFrame(mTimestampNanos, mFrame);
+        }
+```
+
+
+
+#### 2、Choreographer.doFrame/doCallbacks
+
+```java
+void doFrame(long frameTimeNanos, int frame) {
+    final long startNanos;
+    synchronized (mLock) {
+    // ... 
+    try {
+        Trace.traceBegin(Trace.TRACE_TAG_VIEW, "Choreographer#doFrame");
+        AnimationUtils.lockAnimationClock(frameTimeNanos / TimeUtils.NANOS_PER_MS);
+
+      	// 1、输入
+        mFrameInfo.markInputHandlingStart();
+        doCallbacks(Choreographer.CALLBACK_INPUT, frameTimeNanos);
+	
+      	// 1、动画
+        mFrameInfo.markAnimationsStart();
+        doCallbacks(Choreographer.CALLBACK_ANIMATION, frameTimeNanos);
+
+      	// 1、Traversal 处理layout和draw
+        mFrameInfo.markPerformTraversalsStart();
+        doCallbacks(Choreographer.CALLBACK_TRAVERSAL, frameTimeNanos);
+
+      	// 
+        doCallbacks(Choreographer.CALLBACK_COMMIT, frameTimeNanos);
+    } finally {
+        AnimationUtils.unlockAnimationClock();
+        Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+    }
+
+    if (DEBUG_FRAMES) {
+        final long endNanos = System.nanoTime();
+        Log.d(TAG, "Frame " + frame + ": Finished, took "
+                + (endNanos - startNanos) * 0.000001f + " ms, latency "
+                + (startNanos - frameTimeNanos) * 0.000001f + " ms.");
+    }
+}
+}
+
+
+void doCallbacks(int callbackType, long frameTimeNanos) {
+        CallbackRecord callbacks;
+        synchronized (mLock) {
+      	// ...
+        try {
+            Trace.traceBegin(Trace.TRACE_TAG_VIEW, CALLBACK_TRACE_TITLES[callbackType]);
+            for (CallbackRecord c = callbacks; c != null; c = c.next) {
+              	// 这里就是执行各个callback
+                c.run(frameTimeNanos);
+            }
+        } finally {
+            synchronized (mLock) {
+                mCallbacksRunning = false;
+                do {
+                    final CallbackRecord next = callbacks.next;
+                    recycleCallbackLocked(callbacks);
+                    callbacks = next;
+                } while (callbacks != null);
+            }
+            Trace.traceEnd(Trace.TRACE_TAG_VIEW);
+        }
+    }
+```
+
+
+
+#### 3、ViewRootImpl.TraversalRunnable.run
+
+源码参见[2.1 注册监听：ViewRootImpl.scheduleTraversals](#1、ViewRootImpl.scheduleTraversals)
+
+
+
+##相关面试题
+
+**Q1：Android 每隔 16.6 ms 刷新一次屏幕到底指的是什么意思？是指每隔 16.6ms 调用 onDraw() 绘制一次么？** 
+
+
+
+**Q2：如果界面一直保持没变的话，那么还会每隔 16.6ms 刷新一次屏幕么？**
+
+答：我们常说的 Android 每隔 16.6 ms 刷新一次屏幕其实是指底层会以这个固定频率来切换每一帧的画面，而这个每一帧的画面数据就是我们 app 在接收到屏幕刷新信号之后去执行遍历绘制 View 树工作所计算出来的屏幕数据。而 app 并不是每隔 16.6ms 的屏幕刷新信号都可以接收到，只有当 app 向底层注册监听下一个屏幕刷新信号之后，才能接收到下一个屏幕刷新信号到来的通知。而只有当某个 View 发起了刷新请求时，app 才会去向底层注册监听下一个屏幕刷新信号。
+
+也就是说，只有当界面有刷新的需要时，我们 app 才会在下一个屏幕刷新信号来时，遍历绘制 View 树来重新计算屏幕数据。如果界面没有刷新的需要，一直保持不变时，我们 app 就不会去接收每隔 16.6ms 的屏幕刷新信号事件了，但底层仍然会以这个固定频率来切换每一帧的画面，只是后面这些帧的画面都是相同的而已。
+
+**Q3：界面的显示其实就是一个 Activity 的 View 树里所有的 View 都进行测量、布局、绘制操作之后的结果呈现，那么如果这部分工作都完成后，屏幕会马上就刷新么？**
+
+答：我们 app 只负责计算屏幕数据而已，接收到屏幕刷新信号就去计算，计算完毕就计算完毕了。至于屏幕的刷新，这些是由底层以固定的频率来切换屏幕每一帧的画面。所以即使屏幕数据都计算完毕，屏幕会不会马上刷新就取决于底层是否到了要切换下一帧画面的时机了。
+
+**Q4：网上都说避免丢帧的方法之一是保证每次绘制界面的操作要在 16.6ms 内完成，但如果这个 16.6ms 是一个固定的频率的话，请求绘制的操作在代码里被调用的时机是不确定的啊，那么如果某次用户点击屏幕导致的界面刷新操作是在某一个 16.6ms 帧快结束的时候，那么即使这次绘制操作小于 16.6 ms，按道理不也会造成丢帧么？这又该如何理解？** 
+
+答：之所以提了这个问题，是因为之前是以为如果某个 View 发起了刷新请求，比如调用了 invalidte()，那么它的重绘工作就马上开始执行了，所以以前在看网上那些介绍屏幕刷新机制的博客时，经常看见下面这张图：
+
+那个时候就是不大理解，为什么每一次 CPU 计算的工作都刚刚好是在每一个信号到来的那个瞬间开始的呢？毕竟代码里发起刷新屏幕的操作是动态的，不可能每次都刚刚好那么巧。
+
+梳理完屏幕刷新机制后就清楚了，代码里调用了某个 View 发起的刷新请求，这个重绘工作并不会马上就开始，而是需要等到下一个屏幕刷新信号来的时候才开始，所以现在回过头来看这些图就清楚多了。
+
+**Q5：大伙都清楚，主线程耗时的操作会导致丢帧，但是耗时的操作为什么会导致丢帧？它是如何导致丢帧发生的？**
+
+答：造成丢帧大体上有两类原因，一是遍历绘制 View 树计算屏幕数据的时间超过了 16.6ms；二是，主线程一直在处理其他耗时的消息，导致遍历绘制 View 树的工作迟迟不能开始，从而超过了 16.6 ms 底层切换下一帧画面的时机。
+
+第一个原因就是我们写的布局有问题了，需要进行优化了。而第二个原因则是我们常说的避免在主线程中做耗时的任务。
+
+针对第二个原因，系统已经引入了同步屏障消息的机制，尽可能的保证遍历绘制 View 树的工作能够及时进行，但仍没办法完全避免，所以我们还是得尽可能避免主线程耗时工作。
+
+其实第二个原因，可以拿出来细讲的，比如有这种情况， message 不怎么耗时，但数量太多，这同样可能会造成丢帧。如果有使用一些图片框架的，它内部下载图片都是开线程去下载，但当下载完成后需要把图片加载到绑定的 view 上，这个工作就是发了一个 message 切到主线程来做，如果一个界面这种 view 特别多的话，队列里就会有非常多的 message，虽然每个都 message 并不怎么耗时，但经不起量多啊。
+
+
+
+TextView调用setText方法的内部执行流程。
 
 Canvas的底层机制，绘制框架，硬件加速是什么原理，canvas lock的缓冲区是怎么回事？
 
