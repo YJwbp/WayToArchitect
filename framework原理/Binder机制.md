@@ -421,7 +421,94 @@ public interface IInterface
 
 ![Binder通信过程](https://user-gold-cdn.xitu.io/2020/4/24/171ab7a654b4bff7)
 
-------
+### 细节问题
+
+#### 1、oneway
+
+IBinder接口的transact方法，最后一个参数flags，可以有2个值：0、FLAG_ONEWAY
+
+```java
+  /**
+     * The first transaction code available for user commands.
+     */
+    int FIRST_CALL_TRANSACTION  = 0x00000001;
+    /**
+     * The last transaction code available for user commands.
+     */
+    int LAST_CALL_TRANSACTION   = 0x00ffffff;
+
+/**
+ * Perform a generic operation with the object.
+ * 
+ * @param code The action to perform.  This should
+ * be a number between {@link #FIRST_CALL_TRANSACTION} and
+ * {@link #LAST_CALL_TRANSACTION}.
+ * @param data Marshalled data to send to the target.  Must not be null.
+ * If you are not sending any data, you must create an empty Parcel
+ * that is given here.
+ * @param reply Marshalled data to be received from the target.  May be
+ * null if you are not interested in the return value.
+ * @param flags Additional operation flags.  Either 0 for a normal
+ * RPC, or {@link #FLAG_ONEWAY} for a one-way RPC.
+ *
+ * @return Returns the result from {@link Binder#onTransact}.  A successful call
+ * generally returns true; false generally means the transaction code was not
+ * understood.
+ */
+public boolean transact(int code, @NonNull Parcel data, @Nullable Parcel reply, int flags)
+    throws RemoteException;
+```
+
+```java
+/**
+ * Flag to {@link #transact}: this is a one-way call, meaning that the
+ * caller returns immediately, without waiting for a result from the
+ * callee. Applies only if the caller and callee are in different
+ * processes. 调用者立即返回，不等待被调用者的结果；只有跨进程的时候才用
+ *
+ * 对于同一个IBinder对象的多个oneway调用，系统会按照调用顺序依次执行，但是也会从线程池分配线程执行，所以可	  能在不同线程，但是只有前一个执行完才会分发下一个。
+ 2、这两种情况下，执行顺序是无法保证的：对不同IBinder对象的调用；对同一个对象的oneway+非oneway调用
+ * <p>The system provides special ordering semantics for multiple oneway calls
+ * being made to the same IBinder object: these calls will be dispatched in the
+ * other process one at a time, with the same order as the original calls.  These
+ * are still dispatched by the IPC thread pool, so may execute on different threads,
+ * but the next one will not be dispatched until the previous one completes.  This
+ * ordering is not guaranteed for calls on different IBinder objects or when mixing
+ * oneway and non-oneway calls on the same IBinder object.</p>
+ */
+int FLAG_ONEWAY             = 0x00000001;
+```
+
+
+
+aidl的`oneway`标识符，影响的也是这个flag：
+
+```java
+// 默认
+boolean _status = mRemote.transact(Stub.TRANSACTION_start, _data, _reply, 0);
+
+// oneway
+boolean _status = mRemote.transact(Stub.TRANSACTION_stop, _data, null, android.os.IBinder.FLAG_ONEWAY);
+```
+
+##### 启动流程里，oneway怎么用的？
+
+启动流程里，哪些是oneway的呢？？
+
+```
+// IPC 调用，让AMS执行该命令
+mRemote.transact(ATTACH_APPLICATION_TRANSACTION, data, reply, 0);
+
+
+```
+
+#### 2、Binder线程池
+
+Binder线程池？不是Server自己管理？哦 我知道了，因为onTransact是Binder驱动调用的，肯定是它管理的线程池啊
+
+
+
+
 
 # 5. 优点
 
